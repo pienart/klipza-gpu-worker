@@ -5,11 +5,11 @@ Modes:
   subs_only  — single-pass ASS subtitle burn on original video
 
 Input:
-  source_url:  presigned R2 GET URL for source video
-  output_url:  presigned R2 PUT URL for result upload
-  mode:        "auto_subs" | "subs_only"
-  segments:    list of {start, end} keep-segments (auto_subs only)
-  ass_content: ASS subtitle content string
+  source_url:      URL for source video (download)
+  output_filename: Name of the file to be saved on FTP (e.g., "video.mp4")
+  mode:            "auto_subs" | "subs_only"
+  segments:        list of {start, end} keep-segments (auto_subs only)
+  ass_content:     ASS subtitle content string
 
 Health check:
   {"health_check": true} → {"status": "warm"}
@@ -50,11 +50,7 @@ HAS_NVENC = _check_nvenc()
 # ---------------------------------------------------------------------------
 
 def build_zoom_flags(keep_segments: list[dict]) -> list[bool]:
-    """Determine zoom flag per segment: toggle at each real cut (gap > 0.05s).
-
-    First segment is always no-zoom. Zoom toggles only when there is a real
-    gap (content was cut) between consecutive keep-segments.
-    """
+    """Determine zoom flag per segment: toggle at each real cut (gap > 0.05s)."""
     if not keep_segments:
         return []
 
@@ -77,12 +73,7 @@ def build_extraction_cmd(
     zoom: bool,
     use_nvenc: bool,
 ) -> list[str]:
-    """Build FFmpeg command for extracting a single segment with re-encoding.
-
-    Uses NVENC GPU encoding when available, falls back to libx264 ultrafast.
-    Applies alternating zoom crop and 15ms audio fades at boundaries.
-    """
-    # Video filter: zoom crop+scale or just format
+    """Build FFmpeg command for extracting a single segment with re-encoding."""
     if zoom:
         vf = ("crop=trunc(iw*0.97/2)*2:trunc(ih*0.97/2)*2,"
               "scale=ceil(iw/0.97/2)*2:ceil(ih/0.97/2)*2,"
@@ -90,7 +81,6 @@ def build_extraction_cmd(
     else:
         vf = "format=yuv420p"
 
-    # Audio fades: 15ms in/out at segment boundaries
     fade_out_start = max(0, duration - 0.015)
     af = f"afade=t=in:d=0.015,afade=t=out:st={fade_out_start:.3f}:d=0.015"
 
@@ -130,10 +120,7 @@ def build_concat_burn_cmd(
     output_path: str,
     use_nvenc: bool,
 ) -> list[str]:
-    """Build FFmpeg command for concat demuxer + ASS subtitle burn.
-
-    Reads segment files from concat list, applies ASS filter, encodes to output.
-    """
+    """Build FFmpeg command for concat demuxer + ASS subtitle burn."""
     escaped_ass = ass_path.replace(":", "\\:")
 
     if use_nvenc:
@@ -203,7 +190,7 @@ def build_subs_only_cmd(
 # ---------------------------------------------------------------------------
 
 def download_file(url: str, dest: str) -> int:
-    """Download file from presigned URL, return size in bytes."""
+    """Download file from URL, return size in bytes."""
     r = requests.get(url, stream=True, timeout=300)
     r.raise_for_status()
     size = 0
@@ -214,24 +201,22 @@ def download_file(url: str, dest: str) -> int:
     return size
 
 
-def upload_with_retry(path: str, url: str, retries: int = 1) -> None:
-    """Upload file via PUT to presigned R2 URL with retry on failure."""
-    last_err = None
-    for attempt in range(1 + retries):
-        try:
-            with open(path, "rb") as f:
-                r = requests.put(
-                    url, data=f, timeout=600,
-                    headers={"Content-Type": "video/mp4"},
-                )
-                r.raise_for_status()
-            return
-        except (requests.RequestException, IOError) as e:
-            last_err = e
-            if attempt < retries:
-                print(f"Upload attempt {attempt + 1} failed: {e}, retrying...")
-                time.sleep(2)
-    raise RuntimeError(f"Upload failed after {1 + retries} attempts: {last_err}")
+def upload_to_ftp(file_path: str, ftp_host: str, ftp_user: str, ftp_pass: str, file_name: str) -> None:
+    """Uploads file to FTP server."""
+    print(f"FTP sunucusuna bağlanılıyor: {ftp_host}...")
+    try:
+        with ftplib.FTP(ftp_host) as ftp:
+            ftp.login(user=ftp_user, passwd=ftp_pass)
+            
+            # Eğer belirli bir klasöre yüklemek isterseniz aşağıdaki satırı aktifleştirip düzenleyebilirsiniz:
+            # ftp.cwd("httpdocs/videolar")
+            
+            print(f"FTP'ye yükleniyor: {file_name}")
+            with open(file_path, "rb") as f:
+                ftp.storbinary(f"STOR {file_name}", f)
+        print("FTP yüklemesi başarıyla tamamlandı.")
+    except Exception as e:
+        raise RuntimeError(f"FTP Upload hatası: {e}")
 
 
 def run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
@@ -240,7 +225,6 @@ def run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
         cmd, capture_output=True, text=True, timeout=timeout,
     )
     if result.returncode != 0:
-        # Extract meaningful error lines
         lines = result.stderr.splitlines()
         error_lines = [
             ln for ln in lines
@@ -263,23 +247,12 @@ def render_auto_subs(
     output_path: str,
     tmp_dir: str,
 ) -> float:
-    """Render auto_subs mode: extract keep-segments → concat + ASS burn.
-
-    Returns elapsed seconds.
-    Steps:
-      1. Compute zoom flags (alternating at real cuts)
-      2. Extract each keep-segment with re-encode (NVENC or CPU)
-      3. Write concat list + ASS file
-      4. Concat demuxer + ASS subtitle burn → output
-    """
     t0 = time.monotonic()
     use_nvenc = HAS_NVENC
 
-    # 1. Zoom flags
     zoom_flags = build_zoom_flags(segments)
-
-    # 2. Extract segments
     seg_files: list[str] = []
+    
     for i, seg in enumerate(segments):
         pad_start = max(0, seg["start"] - 0.03)
         pad_end = seg["end"] + 0.03
@@ -314,7 +287,6 @@ def render_auto_subs(
 
     print(f"  Segments extracted in {time.monotonic() - t0:.1f}s")
 
-    # 3. Concat list + ASS file
     list_path = os.path.join(tmp_dir, "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for sf in seg_files:
@@ -324,7 +296,6 @@ def render_auto_subs(
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
 
-    # 4. Concat + ASS burn
     t1 = time.monotonic()
     cmd = build_concat_burn_cmd(list_path, ass_path, output_path, use_nvenc)
 
@@ -348,10 +319,6 @@ def render_subs_only(
     output_path: str,
     tmp_dir: str,
 ) -> float:
-    """Render subs_only mode: single-pass ASS burn on original video.
-
-    Returns elapsed seconds.
-    """
     t0 = time.monotonic()
     use_nvenc = HAS_NVENC
 
@@ -381,14 +348,8 @@ def render_subs_only(
 # ---------------------------------------------------------------------------
 
 def handler(event: dict) -> dict:
-    """RunPod serverless handler entry point.
-
-    Validates input, dispatches to render pipeline, manages temp files,
-    returns stats or error dict.
-    """
     inp = event.get("input", {})
 
-    # Health check — instant response for warm-up probes
     if inp.get("health_check"):
         return {"status": "warm"}
 
@@ -396,10 +357,6 @@ def handler(event: dict) -> dict:
     source_url = inp.get("source_url")
     if not source_url:
         return {"error": "source_url required"}
-
-    output_url = inp.get("output_url")
-    if not output_url:
-        return {"error": "output_url required"}
 
     mode = inp.get("mode", "subs_only")
     valid_modes = ("auto_subs", "subs_only")
@@ -413,6 +370,16 @@ def handler(event: dict) -> dict:
     ass_content = inp.get("ass_content")
     if not ass_content:
         return {"error": "ass_content required"}
+
+    # --- FTP Config ---
+    ftp_host = "45.147.46.253"
+    ftp_user = "pienart-ftp"
+    ftp_pass = os.environ.get("FTP_PASSWORD")
+
+    if not ftp_pass:
+        return {"error": "FTP_PASSWORD ortam değişkeni RunPod'da ayarlanmamış."}
+
+    output_filename = inp.get("output_filename", "processed_video.mp4")
 
     # --- Processing ---
     tmp_dir = tempfile.mkdtemp(prefix="klipza_gpu_")
@@ -439,14 +406,17 @@ def handler(event: dict) -> dict:
         output_size = os.path.getsize(output_path)
         print(f"Rendered in {render_time:.1f}s, output {output_size / 1024 / 1024:.1f} MB")
 
-        # 3. Upload result
+        # 3. Upload result via FTP
         t_up = time.monotonic()
-        upload_with_retry(output_path, output_url)
+        
+        upload_to_ftp(output_path, ftp_host, ftp_user, ftp_pass, output_filename)
+        
         upload_time = time.monotonic() - t_up
-        print(f"Uploaded in {upload_time:.1f}s")
+        print(f"Uploaded to FTP in {upload_time:.1f}s")
 
         return {
             "status": "done",
+            "ftp_file": output_filename,
             "mode": mode,
             "gpu": HAS_NVENC,
             "download_time": round(dl_time, 1),
