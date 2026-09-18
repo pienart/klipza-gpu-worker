@@ -14,6 +14,7 @@ Input:
 Health check:
   {"health_check": true} → {"status": "warm"}
 """
+import ftplib
 import os
 import shutil
 import subprocess
